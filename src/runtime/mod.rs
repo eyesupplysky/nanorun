@@ -1,0 +1,29 @@
+//! User-facing entry point: a runtime composes executor, reactor, and timers.
+//!
+//! Most users construct a [`Runtime`] and call [`Runtime::block_on`].
+//! The free function [`crate::executor::block_on`] is the lower-level
+//! escape hatch.
+
+use core::future::Future;
+
+/// Composed runtime: executor + reactor + timer wheel.
+pub struct Runtime;
+
+impl Runtime {
+    /// Construct a runtime with default configuration.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Drive `f` to completion on this runtime.
+    pub fn block_on<F: Future>(&self, f: F) -> F::Output {
+        crate::executor::block_on(f)
+    }
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        Self::new()
+    }
+}

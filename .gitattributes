@@ -1,0 +1,6 @@
+# Force LF for shell scripts and git hooks — they must run via bash on Windows.
+# Without this, core.autocrlf=true converts to CRLF on checkout and bash fails
+# with "bad interpreter" errors when init.sh copies the hook into the public
+# sibling's .git/hooks/ directory.
+*.sh text eol=lf
+.githooks/* text eol=lf
