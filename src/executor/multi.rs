@@ -60,8 +60,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle as ThreadJoinHandle};
 
 use crate::reactor::Reactor;
-use crate::runtime::context::{Guard, HandleGuard, WorkerMarker};
+use crate::runtime::context::{DriverGuard, Guard, HandleGuard, WorkerMarker};
 use crate::task::{spawn_raw, JoinHandle, Schedule, TaskRef};
+use crate::time::Driver;
 
 use worker::{idle, steal, WorkerSlot};
 
@@ -80,6 +81,7 @@ pub(crate) struct Shared {
     next_unpark: AtomicU64,
     shutdown: AtomicBool,
     reactor: Reactor,
+    driver: Driver,
     driver_held: AtomicBool,
     driver_parked: AtomicBool,
 }
@@ -170,6 +172,7 @@ impl Multi {
     pub(crate) fn new(worker_count: usize) -> Self {
         assert!(worker_count >= 1, "Multi requires at least one worker");
         let reactor = Reactor::new().expect("reactor::new");
+        let driver = Driver::new(reactor.handle());
         let mut workers = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
             workers.push(WorkerSlot::new());
@@ -180,6 +183,7 @@ impl Multi {
             next_unpark: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             reactor,
+            driver,
             driver_held: AtomicBool::new(false),
             driver_parked: AtomicBool::new(false),
         });
@@ -230,11 +234,12 @@ impl Drop for Multi {
         for h in core::mem::take(&mut self.threads) {
             h.join().expect("worker thread panicked");
         }
-        // Workers are gone. Drain queues to break the
-        // `Arc<Shared>` ↔ task cycle: each `TaskRef` we drop releases
-        // its task's `Spawner`, which holds an `Arc<Shared>`. Without
-        // this drain, the runtime's allocation lives until every
-        // outstanding waker fires (or never, if it never fires).
+        // Workers are gone. Drain queues and the timer driver to break
+        // the `Arc<Shared>` ↔ task cycle: each `TaskRef` we drop and each
+        // `Waker` the driver holds releases a refcount on a task header,
+        // which transitively keeps the runtime alive. Without these
+        // drops, `Arc<Shared>` would live until every outstanding waker
+        // fires (or never, if it never fires).
         let _guard = Guard::install(&self.shared.reactor);
         self.shared
             .injector
@@ -244,6 +249,7 @@ impl Drop for Multi {
         for w in &self.shared.workers {
             w.local.lock().expect("local queue poisoned").clear();
         }
+        self.shared.driver.clear();
     }
 }
 
@@ -301,10 +307,10 @@ fn run_worker(shared: &Arc<Shared>, my_id: usize) {
         .set(thread::current())
         .expect("worker thread set twice");
 
-    // Three RAII guards bracket the run loop. They are installed in the
-    // order WorkerMarker → HandleGuard → reactor Guard, so on worker
-    // exit they drop in reverse: reactor Guard first (it owns the raw
-    // Reactor pointer and is the most safety-critical), then
+    // Four RAII guards bracket the run loop. They are installed in the
+    // order WorkerMarker → HandleGuard → reactor Guard → DriverGuard,
+    // so on worker exit they drop in reverse: DriverGuard first, then
+    // reactor Guard (which owns the raw Reactor pointer), then
     // HandleGuard, then WorkerMarker.
     let _worker_marker = WorkerMarker::enter();
 
@@ -321,6 +327,11 @@ fn run_worker(shared: &Arc<Shared>, my_id: usize) {
     // current reactor. Tasks polled on this thread call
     // `runtime::context::with_current` to register fds against it.
     let _reactor_guard = Guard::install(&shared.reactor);
+
+    // Install the runtime's timer driver as this worker's thread-local
+    // current driver. `crate::time::sleep` futures register their
+    // wakers via `runtime::context::with_current_driver`.
+    let _driver_guard = DriverGuard::install(&shared.driver);
 
     let mut tick: u64 = 0;
     let mut rng: u64 = (my_id as u64)

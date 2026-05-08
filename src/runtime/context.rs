@@ -16,11 +16,13 @@ use core::ptr::NonNull;
 
 use crate::executor::Handle;
 use crate::reactor::Reactor;
+use crate::time::Driver;
 
 thread_local! {
     static CTX: Cell<Option<NonNull<Reactor>>> = const { Cell::new(None) };
     static HANDLE: RefCell<Option<Handle>> = const { RefCell::new(None) };
     static IS_WORKER: Cell<bool> = const { Cell::new(false) };
+    static DRIVER: Cell<Option<NonNull<Driver>>> = const { Cell::new(None) };
 }
 
 /// RAII guard that installs `&'a Reactor` into the current thread's slot.
@@ -136,4 +138,53 @@ impl Drop for WorkerMarker {
 /// Return `true` if the current thread is inside an active [`WorkerMarker`] bracket.
 pub(crate) fn is_worker() -> bool {
     IS_WORKER.with(Cell::get)
+}
+
+/// RAII guard that installs `&'a Driver` into the current thread's slot.
+pub(crate) struct DriverGuard<'a> {
+    _borrow: PhantomData<&'a Driver>,
+}
+
+impl<'a> DriverGuard<'a> {
+    /// Install `driver` for the duration of the guard. Panics on nested install.
+    pub(crate) fn install(driver: &'a Driver) -> Self {
+        DRIVER.with(|c| {
+            assert!(
+                c.get().is_none(),
+                "nanorun timer driver already installed on this thread",
+            );
+            c.set(Some(NonNull::from(driver)));
+        });
+        Self {
+            _borrow: PhantomData,
+        }
+    }
+}
+
+impl Drop for DriverGuard<'_> {
+    fn drop(&mut self) {
+        DRIVER.with(|c| c.set(None));
+    }
+}
+
+/// Run `f` against the timer driver installed on this thread.
+///
+/// Panics if no [`DriverGuard`] is currently installed.
+pub(crate) fn with_current_driver<R>(f: impl FnOnce(&Driver) -> R) -> R {
+    try_with_current_driver(f).expect(
+        "no nanorun timer driver installed on this thread; \
+         poll this future inside a Runtime::block_on or nanorun::block_on context",
+    )
+}
+
+/// Run `f` against the timer driver installed on this thread, if any.
+#[allow(dead_code)] // wired by Drop paths in later slices
+pub(crate) fn try_with_current_driver<R>(f: impl FnOnce(&Driver) -> R) -> Option<R> {
+    let ptr = DRIVER.with(Cell::get)?;
+    // SAFETY: the live DriverGuard whose `install` set this slot also
+    // holds an active borrow of the same Driver; the borrow checker
+    // therefore prevents the Driver from being dropped or moved while the
+    // slot is populated. The reference handed to `f` cannot outlive this
+    // call.
+    Some(unsafe { f(ptr.as_ref()) })
 }

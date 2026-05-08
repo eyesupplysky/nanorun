@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
 use std::thread::{self, Thread};
+use std::time::Instant;
 
 use crate::task::TaskRef;
 
@@ -68,10 +69,23 @@ pub(super) fn idle(shared: &Shared, my_id: usize) {
             shared.driver_held.store(false, Ordering::Release);
             return;
         }
-        // Block until an fd is ready or `Reactor::handle().wake()` fires.
-        shared.reactor.poll(None).expect("reactor poll");
+        // Bound the reactor poll by the next timer deadline. `None`
+        // (no pending timers) blocks until I/O wake or shutdown wake;
+        // a deadline already in the past produces a zero timeout, so
+        // the reactor returns immediately and we fall through to
+        // `advance`.
+        let now = Instant::now();
+        let timeout = shared
+            .driver
+            .next_deadline()
+            .map(|d| d.saturating_duration_since(now));
+        shared.reactor.poll(timeout).expect("reactor poll");
         shared.driver_parked.store(false, Ordering::SeqCst);
         shared.driver_held.store(false, Ordering::Release);
+        // Fire any timers that have expired during the poll. Wakers
+        // re-enter `Spawner::schedule` and push their tasks onto the
+        // injector — the next loop iteration will pick them up.
+        shared.driver.advance(Instant::now());
         return;
     }
     // Someone else is driving; sleep until unparked. The classic
