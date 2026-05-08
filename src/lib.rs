@@ -12,7 +12,7 @@
 #![warn(missing_docs)]
 
 pub mod executor;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub mod net;
 pub mod reactor;
 pub mod runtime;

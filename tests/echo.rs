@@ -1,10 +1,14 @@
-//! Echo-server integration test (M2, Linux-only).
+//! Echo-server integration test (Linux only — Windows enabled at M5 slice 5).
 //!
 //! Two `block_on`s on two threads — the server binds on `127.0.0.1:0`,
 //! accepts one connection, reads exactly N bytes, writes them back, and
 //! exits. The client connects, writes the same N bytes, reads them
-//! back, and asserts the round-trip matches. `spawn` lands at M3, so
-//! we use `std::thread` for the server side.
+//! back, and asserts the round-trip matches.
+//!
+//! M5 slice 4 broadened `crate::net` to compile on Windows, but the
+//! Windows AFD-poll dispatch loop (slice 3b) is not yet delivering
+//! readiness events under load. Broadening the gate to `windows` is
+//! parked until that runtime bug is debugged in slice 5.
 
 #![cfg(target_os = "linux")]
 

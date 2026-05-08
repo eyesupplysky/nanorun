@@ -4,14 +4,46 @@
 //! linked free list embedded in the vacant entries themselves. No
 //! generation counters in M2 — registration and deregistration are
 //! strictly paired by [`crate::reactor`] callers.
+//!
+//! Shared by the Linux and Windows reactor backends. On Windows each
+//! slot also owns a `Box<WindowsSlotState>` whose stable address is the
+//! `IoStatusBlock` pointer the IOCP returns; recovery from completion
+//! to slot uses `repr(C)` layout (iosb at offset 0).
 
 use core::task::Waker;
+
+#[cfg(target_os = "windows")]
+use crate::sys::windows::afd::{AfdPollInfo, IoStatusBlock};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Networking::WinSock::SOCKET;
+
+/// Per-socket Windows AFD-poll state. Owned via `Box` so its address is stable.
+#[cfg(target_os = "windows")]
+#[repr(C)]
+pub(crate) struct WindowsSlotState {
+    /// IOCP returns a pointer here in `lpOverlapped`. MUST stay at offset 0.
+    pub(crate) iosb: IoStatusBlock,
+    /// Input/output for `IOCTL_AFD_POLL`.
+    pub(crate) info: AfdPollInfo,
+    /// Bottom-of-stack base socket handle (bypasses any LSP layered over the user socket).
+    pub(crate) base_socket: SOCKET,
+    /// Index into the parent slab; recovered via the offset-0 cast.
+    pub(crate) slab_key: usize,
+    /// AFD event mask requested at registration time; replayed on every re-submit to preserve level-triggered semantics.
+    pub(crate) requested_events: u32,
+}
 
 /// Per-fd waker storage. Read and write directions are independent.
 #[derive(Default)]
 pub(crate) struct Slot {
     pub(crate) read: Option<Waker>,
     pub(crate) write: Option<Waker>,
+    /// Windows AFD-poll state — None until [`crate::reactor::Reactor::register`] populates it.
+    #[cfg(target_os = "windows")]
+    pub(crate) windows: Option<Box<WindowsSlotState>>,
+    /// Set by [`crate::reactor::Reactor::deregister`]; the next IOCP completion that touches this slot frees it.
+    #[cfg(target_os = "windows")]
+    pub(crate) cancelled: bool,
 }
 
 enum Entry {
