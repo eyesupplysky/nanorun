@@ -17,3 +17,9 @@ pub mod sys;
 pub mod task;
 pub mod time;
 pub mod waker;
+
+/// Re-export of [`executor::block_on`] for the common case.
+pub use executor::block_on;
+
+/// Re-export of [`runtime::Runtime`] for the common case.
+pub use runtime::Runtime;

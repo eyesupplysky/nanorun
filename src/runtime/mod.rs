@@ -17,6 +17,16 @@ impl Runtime {
     }
 
     /// Drive `f` to completion on this runtime.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use nanorun::Runtime;
+    ///
+    /// let rt = Runtime::new();
+    /// let value = rt.block_on(async { 40 + 2 });
+    /// assert_eq!(value, 42);
+    /// ```
     pub fn block_on<F: Future>(&self, f: F) -> F::Output {
         crate::executor::block_on(f)
     }
