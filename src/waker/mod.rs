@@ -1,60 +1,61 @@
-//! Waker plumbing: hand-rolled `RawWakerVTable` over a `ReactorHandle`.
+//! Waker plumbing: hand-rolled `RawWakerVTable` over a task header pointer.
 //!
-//! When fired, the waker pokes the reactor's cross-thread wake channel
-//! (an eventfd on Linux, a condvar elsewhere). The executor blocked in
-//! `Reactor::poll` returns and the future is polled again. The data
-//! pointer of the [`RawWaker`] is an `Arc<ReactorHandle>` round-tripped
-//! through `Arc::into_raw`.
-//!
-//! When M3 introduces multi-threaded scheduling and `spawn`, this module
-//! gets replaced by a `Schedule`-trait-driven waker that targets a task
-//! header instead of the executor thread.
+//! The data pointer of every [`Waker`] this crate produces is a thin
+//! `*const Header` originating from [`TaskRef::into_raw`]. Cloning the
+//! waker bumps the task's strong refcount via the header's vtable;
+//! `wake()` invokes the same vtable's `schedule` entry, which sets the
+//! task's `NOTIFIED` bit and (if previously idle) pushes the task back
+//! onto a runqueue.
 
+use core::ptr::NonNull;
 use core::task::{RawWaker, RawWakerVTable, Waker};
-use std::sync::Arc;
 
-use crate::reactor::ReactorHandle;
+use crate::task::raw::{Header, TaskRef};
 
-/// Build a [`Waker`] that wakes `handle`'s reactor when fired.
-pub(crate) fn waker_for(handle: ReactorHandle) -> Waker {
-    let arc = Arc::new(handle);
-    let raw = RawWaker::new(Arc::into_raw(arc).cast::<()>(), &VTABLE);
-    // SAFETY: `raw` was just built from a vtable whose contracts are
-    // upheld by `clone_raw`, `wake_raw`, `wake_by_ref_raw`, and
-    // `drop_raw` below.
+/// Build a [`Waker`] whose `wake()` re-schedules `task`.
+pub(crate) fn waker_for_task(task: TaskRef) -> Waker {
+    let ptr = task.into_raw();
+    let raw = RawWaker::new(ptr.as_ptr().cast::<()>(), &TASK_VTABLE);
+    // SAFETY: the task vtable upholds the `RawWakerVTable` contracts;
+    // see invariants on the four fns below.
     unsafe { Waker::from_raw(raw) }
 }
 
-static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_raw, wake_raw, wake_by_ref_raw, drop_raw);
+static TASK_VTABLE: RawWakerVTable =
+    RawWakerVTable::new(task_clone, task_wake, task_wake_by_ref, task_drop);
 
-unsafe fn clone_raw(data: *const ()) -> RawWaker {
-    // SAFETY: `data` originates from `Arc::<ReactorHandle>::into_raw` per
-    // the module invariant; `increment_strong_count` is the documented
-    // way to clone without round-tripping through `Arc::from_raw`.
+unsafe fn task_clone(data: *const ()) -> RawWaker {
+    // SAFETY: the module invariant on `waker_for_task` guarantees `data`
+    // is a header pointer; the vtable's `clone_ref` bumps the count.
+    let ptr = unsafe { NonNull::new_unchecked(data.cast::<Header>().cast_mut()) };
+    // SAFETY: same as above.
     unsafe {
-        Arc::<ReactorHandle>::increment_strong_count(data.cast::<ReactorHandle>());
+        (ptr.as_ref().vtable.clone_ref)(ptr);
     }
-    RawWaker::new(data, &VTABLE)
+    RawWaker::new(data, &TASK_VTABLE)
 }
 
-unsafe fn wake_raw(data: *const ()) {
-    // SAFETY: `data` originates from `Arc::<ReactorHandle>::into_raw`;
-    // we are taking back the strong count that the producing `into_raw`
-    // left behind (or that `clone_raw` added).
-    let arc = unsafe { Arc::<ReactorHandle>::from_raw(data.cast::<ReactorHandle>()) };
-    arc.wake().expect("reactor wake");
+unsafe fn task_wake(data: *const ()) {
+    let ptr = unsafe { NonNull::new_unchecked(data.cast::<Header>().cast_mut()) };
+    // SAFETY: invariant on `waker_for_task`; schedule consumes the ref.
+    unsafe {
+        (ptr.as_ref().vtable.schedule)(ptr);
+    }
 }
 
-unsafe fn wake_by_ref_raw(data: *const ()) {
-    // SAFETY: `data` originates from `Arc::<ReactorHandle>::into_raw`; we
-    // cast it to a shared reference for the duration of the `wake` call
-    // and never drop the underlying allocation.
-    let handle = unsafe { &*data.cast::<ReactorHandle>() };
-    handle.wake().expect("reactor wake");
+unsafe fn task_wake_by_ref(data: *const ()) {
+    let ptr = unsafe { NonNull::new_unchecked(data.cast::<Header>().cast_mut()) };
+    // SAFETY: bump the count, then hand the bumped ref to `schedule`.
+    unsafe {
+        (ptr.as_ref().vtable.clone_ref)(ptr);
+        (ptr.as_ref().vtable.schedule)(ptr);
+    }
 }
 
-unsafe fn drop_raw(data: *const ()) {
-    // SAFETY: `data` originates from `Arc::<ReactorHandle>::into_raw`;
-    // reclaim the strong count and let the `Arc` drop run.
-    drop(unsafe { Arc::<ReactorHandle>::from_raw(data.cast::<ReactorHandle>()) });
+unsafe fn task_drop(data: *const ()) {
+    let ptr = unsafe { NonNull::new_unchecked(data.cast::<Header>().cast_mut()) };
+    // SAFETY: reclaim the strong count via the vtable.
+    unsafe {
+        (ptr.as_ref().vtable.drop_ref)(ptr);
+    }
 }

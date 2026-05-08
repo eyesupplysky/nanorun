@@ -25,3 +25,6 @@ pub use executor::block_on;
 
 /// Re-export of [`runtime::Runtime`] for the common case.
 pub use runtime::Runtime;
+
+/// Re-export of [`task::JoinHandle`] for the common case.
+pub use task::JoinHandle;

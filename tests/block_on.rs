@@ -1,8 +1,10 @@
-//! Integration tests for the M1 single-threaded `block_on` entry point.
+//! Integration tests for the entry-point future drivers.
 //!
 //! These tests link against `nanorun` as an external user would. They
 //! cover: the no-park ready path, the cross-thread wake path, ordinary
 //! async syntax, and the `Runtime::block_on` passthrough contract.
+//! Since M3, both the free `block_on` fn and `Runtime::block_on` route
+//! through the multi-worker executor.
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
