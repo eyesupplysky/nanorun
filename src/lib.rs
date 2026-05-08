@@ -11,6 +11,8 @@
 #![warn(missing_docs)]
 
 pub mod executor;
+#[cfg(target_os = "linux")]
+pub mod net;
 pub mod reactor;
 pub mod runtime;
 pub mod sys;

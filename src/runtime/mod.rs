@@ -2,7 +2,9 @@
 //!
 //! Most users construct a [`Runtime`] and call [`Runtime::block_on`].
 //! The free function [`crate::executor::block_on`] is the lower-level
-//! escape hatch.
+//! escape hatch and uses the same per-call reactor.
+
+pub(crate) mod context;
 
 use core::future::Future;
 
