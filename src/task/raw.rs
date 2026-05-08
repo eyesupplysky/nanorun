@@ -226,6 +226,8 @@ unsafe fn typed<F: Future, S: Schedule>(ptr: NonNull<Header>) -> *const RawTask<
     ptr.as_ptr().cast::<RawTask<F, S>>()
 }
 
+// `state` (header bits) and `stage` (output cell) are intentionally distinct names for distinct concepts.
+#[allow(clippy::similar_names)]
 unsafe fn poll_fn<F, S>(ptr: NonNull<Header>)
 where
     F: Future + Send + 'static,
@@ -245,12 +247,10 @@ where
             return;
         }
         let new = (state | RUNNING) & !NOTIFIED;
-        match header.state.compare_exchange_weak(
-            state,
-            new,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match header
+            .state
+            .compare_exchange_weak(state, new, Ordering::AcqRel, Ordering::Acquire)
+        {
             Ok(_) => break,
             Err(actual) => state = actual,
         }
@@ -454,9 +454,9 @@ pub(crate) fn drop_join_interest(header: &Header) {
 mod tests {
     use super::*;
     use core::pin::Pin;
-    use std::task::Wake;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex as StdMutex;
+    use std::task::Wake;
 
     use crate::task::JoinHandle;
 
@@ -553,7 +553,10 @@ mod tests {
         }
 
         drain(&queue);
-        assert!(count.0.load(Ordering::SeqCst) >= 1, "join waker fires once on completion");
+        assert!(
+            count.0.load(Ordering::SeqCst) >= 1,
+            "join waker fires once on completion"
+        );
 
         match Pin::new(&mut handle).poll(&mut cx) {
             Poll::Ready(v) => assert_eq!(v, 99),
@@ -579,4 +582,3 @@ mod tests {
         // refcount machinery dropping the allocation.
     }
 }
-

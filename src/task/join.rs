@@ -6,9 +6,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::sync::atomic::Ordering;
 
-use crate::task::raw::{
-    drop_join_interest, try_take_output, TaskRef, COMPLETE, JOIN_WAKER,
-};
+use crate::task::raw::{drop_join_interest, try_take_output, TaskRef, COMPLETE, JOIN_WAKER};
 
 /// Handle returned from spawning a task. Awaiting it yields the task's output.
 ///

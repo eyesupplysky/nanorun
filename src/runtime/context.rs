@@ -1,19 +1,26 @@
-//! Thread-local "current reactor" plumbing.
+//! Thread-local runtime context: current reactor, current [`Handle`],
+//! and a worker-thread marker.
 //!
-//! [`crate::executor::single::run`] installs a [`Guard`] before polling
-//! the user future; user-side I/O types (the M2 [`crate::net`] module on
-//! Linux) call [`with_current`] to register interest with the running
-//! reactor. The guard's lifetime brackets the borrow, so the raw pointer
-//! stored in the thread-local is always live when read.
+//! Worker threads install three RAII guards on entry: a [`WorkerMarker`]
+//! flag (so [`Runtime::block_on`](crate::Runtime::block_on) can detect
+//! and reject nested calls), a [`HandleGuard`], and a reactor [`Guard`].
+//! User-side I/O types call [`with_current`] to register interest with
+//! the running reactor; user code spawning from inside a task calls
+//! [`crate::Handle::current`], which reads the handle slot. Each guard's
+//! lifetime brackets its borrow, so the values stored in the
+//! thread-locals are always live when read.
 
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 
+use crate::executor::Handle;
 use crate::reactor::Reactor;
 
 thread_local! {
     static CTX: Cell<Option<NonNull<Reactor>>> = const { Cell::new(None) };
+    static HANDLE: RefCell<Option<Handle>> = const { RefCell::new(None) };
+    static IS_WORKER: Cell<bool> = const { Cell::new(false) };
 }
 
 /// RAII guard that installs `&'a Reactor` into the current thread's slot.
@@ -66,4 +73,67 @@ pub(crate) fn try_with_current<R>(f: impl FnOnce(&Reactor) -> R) -> Option<R> {
     // prevents the Reactor from being dropped or moved while the slot is
     // populated. The reference handed to `f` cannot outlive this call.
     Some(unsafe { f(ptr.as_ref()) })
+}
+
+/// RAII guard installing a [`Handle`] into the current thread's slot.
+pub(crate) struct HandleGuard {
+    _priv: (),
+}
+
+impl HandleGuard {
+    /// Install `handle` for the duration of the guard. Panics on nested install.
+    pub(crate) fn install(handle: Handle) -> Self {
+        HANDLE.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            assert!(
+                slot.is_none(),
+                "nanorun handle already installed on this thread",
+            );
+            *slot = Some(handle);
+        });
+        Self { _priv: () }
+    }
+}
+
+impl Drop for HandleGuard {
+    fn drop(&mut self) {
+        HANDLE.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+    }
+}
+
+/// Return a clone of the current thread's [`Handle`], if any is installed.
+pub(crate) fn current_handle() -> Option<Handle> {
+    HANDLE.with(|cell| cell.borrow().as_ref().cloned())
+}
+
+/// RAII guard that flags the current thread as a runtime worker.
+pub(crate) struct WorkerMarker {
+    _priv: (),
+}
+
+impl WorkerMarker {
+    /// Mark the current thread as a worker for the duration of the guard. Panics on nested install.
+    pub(crate) fn enter() -> Self {
+        IS_WORKER.with(|cell| {
+            assert!(
+                !cell.get(),
+                "nanorun WorkerMarker already installed on this thread",
+            );
+            cell.set(true);
+        });
+        Self { _priv: () }
+    }
+}
+
+impl Drop for WorkerMarker {
+    fn drop(&mut self) {
+        IS_WORKER.with(|cell| cell.set(false));
+    }
+}
+
+/// Return `true` if the current thread is inside an active [`WorkerMarker`] bracket.
+pub(crate) fn is_worker() -> bool {
+    IS_WORKER.with(Cell::get)
 }

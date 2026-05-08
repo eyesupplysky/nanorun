@@ -3,16 +3,20 @@
 //! N worker threads compete over runnable tasks via per-worker LIFO
 //! local queues, a shared injector, and work-stealing across peers.
 //! Wakers schedule tasks through the [`Spawner`], which pushes the
-//! ref onto the injector and unparks one worker.
+//! ref onto the injector and conditionally fires the reactor wake.
 //!
 //! # Layout
 //!
 //! - [`Shared`] — `Arc`-shared state: injector queue, per-worker slots,
-//!   shutdown signal, round-robin unpark cursor.
-//! - [`WorkerSlot`] — per-worker state: local LIFO `VecDeque` and the
-//!   `OnceLock<Thread>` populated when the worker thread starts.
-//! - [`Spawner`] — facade that implements [`Schedule`] and exposes
-//!   `spawn` to user code.
+//!   shutdown signal, round-robin unpark cursor, driver-token + parked
+//!   flag.
+//! - [`worker::WorkerSlot`] — per-worker state (sibling submodule):
+//!   local LIFO `VecDeque` and the `OnceLock<Thread>` populated when the
+//!   worker thread starts.
+//! - [`Spawner`] — internal facade that implements [`Schedule`].
+//! - [`Handle`] — public, cheap-clone wrapper exposing `spawn` to user
+//!   code; obtainable via [`Runtime::handle`](crate::Runtime::handle) or
+//!   [`Handle::current`] from inside a spawned task.
 //! - [`Multi`] — owns the spawned worker threads and the shared state.
 //!
 //! # Scheduling
@@ -34,40 +38,42 @@
 //!   That call blocks the worker in `epoll_wait` (Linux) or a condvar
 //!   wait (fallback) until either an fd becomes ready or
 //!   [`ReactorHandle::wake`](crate::reactor::ReactorHandle::wake)
-//!   fires. On return, the worker releases the token and re-enters
-//!   the run loop.
+//!   fires.
 //! - **Park path:** workers that lost the CAS call [`thread::park`].
 //!
-//! Every [`Spawner::schedule`] both fires `ReactorHandle::wake` (in case
-//! the driver is parked in `epoll_wait`) and unparks one worker (in
-//! case any are in `thread::park`). The two paths are independent; the
-//! double-fire is idempotent and cheap.
-//!
-//! The classic "set parked, re-check, then park" race is avoided
-//! because [`thread::park`] respects the unpark token deposited by any
-//! prior schedule.
+//! `Spawner::schedule` unconditionally pushes onto the injector and
+//! unparks one worker (the unpark token is idempotent and cheap). It
+//! fires `ReactorHandle::wake` only when [`Shared::driver_parked`]
+//! observes a driver currently inside `Reactor::poll`. The
+//! park-side/schedule-side memory ordering that makes this gate
+//! lost-wakeup-free is documented in [`worker::idle`].
+
+mod worker;
+
+#[cfg(test)]
+mod tests;
 
 use core::future::Future;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::thread::{self, JoinHandle as ThreadJoinHandle, Thread};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle as ThreadJoinHandle};
 
 use crate::reactor::Reactor;
-use crate::runtime::context::Guard;
+use crate::runtime::context::{Guard, HandleGuard, WorkerMarker};
 use crate::task::{spawn_raw, JoinHandle, Schedule, TaskRef};
+
+use worker::{idle, steal, WorkerSlot};
 
 /// Per-tick budget before a worker prefers the injector over its local queue.
 /// 61 is tokio's number — large enough for cache-friendly LIFO bursts,
 /// small enough that the global queue cannot starve.
 const POLL_BUDGET: u64 = 61;
 
-struct WorkerSlot {
-    thread: OnceLock<Thread>,
-    local: Mutex<VecDeque<TaskRef>>,
-}
-
 /// Per-runtime shared state. Lives behind an [`Arc`].
+///
+/// Fields are module-private; the [`worker`] submodule accesses them
+/// through Rust's parent-to-child visibility rule.
 pub(crate) struct Shared {
     injector: Mutex<VecDeque<TaskRef>>,
     workers: Vec<WorkerSlot>,
@@ -75,6 +81,7 @@ pub(crate) struct Shared {
     shutdown: AtomicBool,
     reactor: Reactor,
     driver_held: AtomicBool,
+    driver_parked: AtomicBool,
 }
 
 /// Schedule facade implementing [`Schedule`] over a [`Shared`] runtime.
@@ -96,13 +103,7 @@ impl Schedule for Spawner {
             return;
         }
         push_global(&self.shared, task);
-        // Wake whichever idle worker is reachable: the driver via the
-        // reactor handle, any thread-parked worker via unpark.
-        self.shared
-            .reactor
-            .handle()
-            .wake()
-            .expect("reactor wake from schedule");
+        wake_driver_if_parked(&self.shared);
         unpark_one(&self.shared);
     }
 }
@@ -116,13 +117,45 @@ impl Spawner {
     {
         let (queue_ref, join_ref) = spawn_raw(future, self.clone());
         push_global(&self.shared, queue_ref);
-        self.shared
-            .reactor
-            .handle()
-            .wake()
-            .expect("reactor wake from spawn");
+        wake_driver_if_parked(&self.shared);
         unpark_one(&self.shared);
         JoinHandle::new(join_ref)
+    }
+}
+
+/// Public, cheap-clone handle to a runtime. Obtain one via
+/// [`Runtime::handle`](crate::Runtime::handle) on any thread, or
+/// [`Handle::current`] from inside a spawned task.
+#[derive(Clone)]
+pub struct Handle {
+    spawner: Spawner,
+}
+
+impl Handle {
+    /// Return the current thread's [`Handle`], panicking if none is installed.
+    ///
+    /// Only callable from inside a future polled by a nanorun worker thread.
+    #[must_use]
+    pub fn current() -> Self {
+        crate::runtime::context::current_handle().expect(
+            "Handle::current() called outside a nanorun runtime worker thread; \
+             use Runtime::handle on any thread, or call this only from inside a spawned task",
+        )
+    }
+
+    /// Return the current thread's [`Handle`], or `None` if none is installed.
+    #[must_use]
+    pub fn try_current() -> Option<Self> {
+        crate::runtime::context::current_handle()
+    }
+
+    /// Spawn `future` onto the runtime; returns a [`JoinHandle`] for its output.
+    pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.spawner.spawn(future)
     }
 }
 
@@ -139,10 +172,7 @@ impl Multi {
         let reactor = Reactor::new().expect("reactor::new");
         let mut workers = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
-            workers.push(WorkerSlot {
-                thread: OnceLock::new(),
-                local: Mutex::new(VecDeque::new()),
-            });
+            workers.push(WorkerSlot::new());
         }
         let shared = Arc::new(Shared {
             injector: Mutex::new(VecDeque::new()),
@@ -151,6 +181,7 @@ impl Multi {
             shutdown: AtomicBool::new(false),
             reactor,
             driver_held: AtomicBool::new(false),
+            driver_parked: AtomicBool::new(false),
         });
         let mut threads = Vec::with_capacity(worker_count);
         for i in 0..worker_count {
@@ -171,12 +202,21 @@ impl Multi {
         }
     }
 
+    /// Public-API [`Handle`] to this runtime.
+    pub(crate) fn handle(&self) -> Handle {
+        Handle {
+            spawner: self.spawner(),
+        }
+    }
 }
 
 impl Drop for Multi {
     fn drop(&mut self) {
         self.shared.shutdown.store(true, Ordering::Release);
-        // Break out the driver if any is parked in `reactor.poll`.
+        // Break out the driver if any is parked in `reactor.poll`. The
+        // shutdown wake is unconditional: we do not consult
+        // `driver_parked` because we want to fire the eventfd whether
+        // the flag was visible to us or not.
         self.shared
             .reactor
             .handle()
@@ -231,12 +271,24 @@ fn pop_local(shared: &Shared, id: usize) -> Option<TaskRef> {
         .pop_back()
 }
 
+fn wake_driver_if_parked(shared: &Shared) {
+    if shared.driver_parked.load(Ordering::SeqCst) {
+        shared
+            .reactor
+            .handle()
+            .wake()
+            .expect("reactor wake from schedule");
+    }
+}
+
 fn unpark_one(shared: &Shared) {
     let n = shared.workers.len();
     if n == 0 {
         return;
     }
     let raw = shared.next_unpark.fetch_add(1, Ordering::Relaxed);
+    // `raw % n` lies in `0..n` where `n: usize`, so the result fits in usize on every target.
+    #[allow(clippy::cast_possible_truncation)]
     let idx = (raw % n as u64) as usize;
     if let Some(th) = shared.workers[idx].thread.get() {
         th.unpark();
@@ -249,10 +301,26 @@ fn run_worker(shared: &Arc<Shared>, my_id: usize) {
         .set(thread::current())
         .expect("worker thread set twice");
 
+    // Three RAII guards bracket the run loop. They are installed in the
+    // order WorkerMarker → HandleGuard → reactor Guard, so on worker
+    // exit they drop in reverse: reactor Guard first (it owns the raw
+    // Reactor pointer and is the most safety-critical), then
+    // HandleGuard, then WorkerMarker.
+    let _worker_marker = WorkerMarker::enter();
+
+    // Install the runtime's [`Handle`] as this worker's thread-local
+    // current handle. `Handle::current()` and `nanorun::spawn` read this
+    // slot.
+    let _handle_guard = HandleGuard::install(Handle {
+        spawner: Spawner {
+            shared: Arc::clone(shared),
+        },
+    });
+
     // Install the runtime's reactor as this worker's thread-local
     // current reactor. Tasks polled on this thread call
     // `runtime::context::with_current` to register fds against it.
-    let _guard = Guard::install(&shared.reactor);
+    let _reactor_guard = Guard::install(&shared.reactor);
 
     let mut tick: u64 = 0;
     let mut rng: u64 = (my_id as u64)
@@ -272,251 +340,17 @@ fn run_worker(shared: &Arc<Shared>, my_id: usize) {
 
         let task = match task {
             Some(t) => t,
-            None => match steal(shared, my_id, &mut rng) {
-                Some(t) => t,
-                None => {
+            None => {
+                if let Some(t) = steal(shared, my_id, &mut rng) {
+                    t
+                } else {
                     idle(shared, my_id);
                     continue;
                 }
-            },
+            }
         };
 
         task.poll();
         tick = tick.wrapping_add(1);
-    }
-}
-
-fn idle(shared: &Shared, my_id: usize) {
-    if shared.shutdown.load(Ordering::Acquire) {
-        return;
-    }
-    if has_work(shared, my_id) {
-        return;
-    }
-    if shared
-        .driver_held
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_ok()
-    {
-        // We are the driver. Block on the reactor until something fires.
-        // Spurious returns are safe — the run loop re-checks queues.
-        shared.reactor.poll(None).expect("reactor poll");
-        shared.driver_held.store(false, Ordering::Release);
-        return;
-    }
-    // Someone else is driving; sleep until unparked.
-    thread::park();
-}
-
-fn steal(shared: &Shared, my_id: usize, rng: &mut u64) -> Option<TaskRef> {
-    let n = shared.workers.len();
-    if n <= 1 {
-        return None;
-    }
-    let start = (xorshift64(rng) as usize) % n;
-    for i in 0..n {
-        let victim = (start + i) % n;
-        if victim == my_id {
-            continue;
-        }
-        if let Some(t) = steal_from(shared, victim, my_id) {
-            return Some(t);
-        }
-    }
-    None
-}
-
-fn steal_from(shared: &Shared, victim: usize, my_id: usize) -> Option<TaskRef> {
-    let mut victim_q = shared.workers[victim]
-        .local
-        .lock()
-        .expect("victim local poisoned");
-    let total = victim_q.len();
-    if total == 0 {
-        return None;
-    }
-    let take = total.div_ceil(2);
-    let mut stolen: VecDeque<TaskRef> = victim_q.drain(..take).collect();
-    drop(victim_q);
-
-    let first = stolen.pop_front();
-    if !stolen.is_empty() {
-        let mut my_q = shared.workers[my_id]
-            .local
-            .lock()
-            .expect("local queue poisoned");
-        my_q.extend(stolen);
-    }
-    first
-}
-
-fn has_work(shared: &Shared, my_id: usize) -> bool {
-    if !shared.workers[my_id]
-        .local
-        .lock()
-        .expect("local queue poisoned")
-        .is_empty()
-    {
-        return true;
-    }
-    if !shared
-        .injector
-        .lock()
-        .expect("injector poisoned")
-        .is_empty()
-    {
-        return true;
-    }
-    for (i, w) in shared.workers.iter().enumerate() {
-        if i == my_id {
-            continue;
-        }
-        if !w.local.lock().expect("victim local poisoned").is_empty() {
-            return true;
-        }
-    }
-    false
-}
-
-fn xorshift64(state: &mut u64) -> u64 {
-    let mut x = *state;
-    if x == 0 {
-        x = 0xDEAD_BEEF_CAFE_F00D;
-    }
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    *state = x;
-    x
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use core::pin::Pin;
-    use core::task::{Context, Poll, Waker};
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomOrd};
-    use std::sync::Arc;
-    use std::task::Wake;
-    use std::time::{Duration, Instant};
-
-    /// Block the calling thread on `handle`'s completion using a thread-park waker.
-    fn block_on_handle<T: Send + 'static>(mut handle: JoinHandle<T>) -> T {
-        struct ThreadWaker(Thread);
-        impl Wake for ThreadWaker {
-            fn wake(self: Arc<Self>) {
-                self.0.unpark();
-            }
-        }
-        let waker = Waker::from(Arc::new(ThreadWaker(thread::current())));
-        let mut cx = Context::from_waker(&waker);
-        loop {
-            match Pin::new(&mut handle).poll(&mut cx) {
-                Poll::Ready(v) => return v,
-                Poll::Pending => thread::park(),
-            }
-        }
-    }
-
-    #[test]
-    fn ready_future_completes() {
-        let multi = Multi::new(2);
-        let h = multi.spawner().spawn(async { 42_u32 });
-        let v = block_on_handle(h);
-        drop(multi);
-        assert_eq!(v, 42);
-    }
-
-    #[test]
-    fn many_tasks_all_complete() {
-        let multi = Multi::new(4);
-        let counter = Arc::new(AtomicUsize::new(0));
-        let mut handles = Vec::new();
-        for _ in 0..1000 {
-            let c = Arc::clone(&counter);
-            handles.push(multi.spawner().spawn(async move {
-                c.fetch_add(1, AtomOrd::SeqCst);
-            }));
-        }
-        for h in handles {
-            block_on_handle(h);
-        }
-        drop(multi);
-        assert_eq!(counter.load(AtomOrd::SeqCst), 1000);
-    }
-
-    #[test]
-    fn yielding_task_progresses() {
-        struct YieldN(usize);
-        impl Future for YieldN {
-            type Output = usize;
-            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<usize> {
-                if self.0 == 0 {
-                    Poll::Ready(0)
-                } else {
-                    self.0 -= 1;
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
-            }
-        }
-        let multi = Multi::new(2);
-        let h = multi.spawner().spawn(YieldN(50));
-        let v = block_on_handle(h);
-        drop(multi);
-        assert_eq!(v, 0);
-    }
-
-    #[test]
-    fn cross_worker_wake_delivers() {
-        // A task parks on a custom waker, then another thread wakes it via that waker.
-        let multi = Multi::new(2);
-        let signal = Arc::new(Mutex::new((false, None::<Waker>)));
-
-        let s = Arc::clone(&signal);
-        struct Park {
-            slot: Arc<Mutex<(bool, Option<Waker>)>>,
-        }
-        impl Future for Park {
-            type Output = u32;
-            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u32> {
-                let mut g = self.slot.lock().expect("park slot poisoned");
-                if g.0 {
-                    Poll::Ready(7)
-                } else {
-                    g.1 = Some(cx.waker().clone());
-                    Poll::Pending
-                }
-            }
-        }
-
-        let h = multi.spawner().spawn(Park { slot: s });
-
-        // Sleep briefly to ensure the task has parked.
-        thread::sleep(Duration::from_millis(20));
-        {
-            let mut g = signal.lock().expect("park slot poisoned");
-            g.0 = true;
-            if let Some(w) = g.1.take() {
-                w.wake();
-            }
-        }
-
-        let started = Instant::now();
-        let v = block_on_handle(h);
-        assert!(started.elapsed() < Duration::from_secs(2));
-        assert_eq!(v, 7);
-        drop(multi);
-    }
-
-    #[test]
-    fn shutdown_joins_all_workers() {
-        let multi = Multi::new(4);
-        let started = Instant::now();
-        drop(multi);
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "shutdown should not stall on idle workers"
-        );
     }
 }

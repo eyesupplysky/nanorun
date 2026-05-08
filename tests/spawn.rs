@@ -1,10 +1,11 @@
-//! Integration tests for `Runtime::spawn` and `JoinHandle` (M3).
+//! Integration tests for `Runtime::spawn`, `JoinHandle`, and `Handle` (M3).
 //!
 //! These tests exercise the public spawn API as an external user would.
 //! They cover: spawn-then-await, throughput across many tasks, cross-task
-//! wakes, JoinHandle drop-detach, multiple coexisting runtimes, runtime
-//! drop while tasks are queued, and nested spawn through an
-//! `Arc<Runtime>` handle.
+//! wakes, [`JoinHandle`] drop-detach, multiple coexisting runtimes,
+//! runtime drop while tasks are queued, nested spawn via a captured
+//! [`Handle`], nested spawn via [`nanorun::spawn`] (reads the per-worker
+//! thread-local), and cross-thread [`Handle`] clone.
 
 use core::future::Future;
 use core::pin::Pin;
@@ -14,13 +15,13 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nanorun::Runtime;
+use nanorun::{Handle, Runtime};
 
 #[test]
 fn spawn_completes_and_yields_value() {
     let rt = Runtime::with_workers(2);
     let h = rt.spawn(async { 42_u32 });
-    let v = rt.block_on(async move { h.await });
+    let v = rt.block_on(h);
     assert_eq!(v, 42);
 }
 
@@ -60,15 +61,79 @@ fn join_handle_drop_detaches_task() {
 }
 
 #[test]
-fn nested_spawn_via_arc_runtime() {
-    let rt = Arc::new(Runtime::with_workers(2));
-    let rt_inner = Arc::clone(&rt);
+fn nested_spawn_via_handle() {
+    let rt = Runtime::with_workers(2);
+    let handle = rt.handle();
     let h = rt.spawn(async move {
-        let inner = rt_inner.spawn(async { 7_u32 });
+        let inner = handle.spawn(async { 7_u32 });
         inner.await
     });
-    let v = rt.block_on(async move { h.await });
+    let v = rt.block_on(h);
     assert_eq!(v, 7);
+}
+
+#[test]
+fn nested_spawn_via_current() {
+    // Inside a spawned task, `nanorun::spawn` reads the per-worker
+    // thread-local installed by the runtime. No captured handle needed.
+    let rt = Runtime::with_workers(2);
+    let h = rt.spawn(async move {
+        let inner = nanorun::spawn(async { 13_u32 });
+        inner.await
+    });
+    let v = rt.block_on(h);
+    assert_eq!(v, 13);
+}
+
+#[test]
+fn handle_clone_across_threads() {
+    // `Handle: Clone + Send + Sync`. Move a clone to a non-runtime thread,
+    // spawn from there, then await on the runtime.
+    let rt = Runtime::with_workers(2);
+    let off_thread_handle = rt.handle();
+    let join = thread::spawn(move || off_thread_handle.spawn(async { 17_u32 }));
+    let task = join.join().expect("off-runtime thread panicked");
+    let v = rt.block_on(task);
+    assert_eq!(v, 17);
+}
+
+#[test]
+#[should_panic(expected = "outside a nanorun runtime worker thread")]
+fn handle_current_outside_runtime_panics() {
+    // Main test thread is not a nanorun worker; `Handle::current()` panics.
+    let _ = Handle::current();
+}
+
+#[test]
+fn block_on_inside_worker_panics() {
+    use std::any::Any;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    // The spawned task catches its own panic so the worker thread does
+    // not unwind out of `run_worker`; the catch result rides out via the
+    // JoinHandle output.
+    let rt = Arc::new(Runtime::with_workers(1));
+    let rt_for_task = Arc::clone(&rt);
+
+    let h = rt.spawn(async move {
+        catch_unwind(AssertUnwindSafe(|| {
+            rt_for_task.block_on(async { 0_u32 });
+        }))
+    });
+
+    let result: Result<(), Box<dyn Any + Send>> = rt.block_on(h);
+    let payload = result.expect_err("Runtime::block_on inside a worker should panic");
+    let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        String::from("<unknown panic payload>")
+    };
+    assert!(
+        msg.contains("block_on") && msg.contains("worker"),
+        "expected block_on/worker panic message, got: {msg}",
+    );
 }
 
 #[test]
@@ -96,7 +161,7 @@ fn cross_task_signal_via_waker() {
     let waiter = rt.spawn({
         let slot = Arc::clone(&slot);
         let signal = Arc::clone(&signal);
-        async move { Wait { slot, signal }.await }
+        Wait { slot, signal }
     });
 
     let signaller = rt.spawn({
@@ -126,8 +191,8 @@ fn multiple_runtimes_are_independent() {
     let rt2 = Runtime::with_workers(1);
     let h1 = rt1.spawn(async { "a" });
     let h2 = rt2.spawn(async { "b" });
-    let v1 = rt1.block_on(async move { h1.await });
-    let v2 = rt2.block_on(async move { h2.await });
+    let v1 = rt1.block_on(h1);
+    let v2 = rt2.block_on(h2);
     assert_eq!(v1, "a");
     assert_eq!(v2, "b");
 }
@@ -150,7 +215,7 @@ fn runtime_drop_with_queued_tasks_does_not_hang() {
 
     let rt = Runtime::with_workers(1);
     for _ in 0..200 {
-        rt.spawn(async { YieldOnce(false).await });
+        rt.spawn(YieldOnce(false));
     }
     let started = Instant::now();
     drop(rt);
@@ -163,24 +228,15 @@ fn runtime_drop_with_queued_tasks_does_not_hang() {
 
 #[test]
 fn yielding_tasks_make_progress_under_contention() {
-    struct YieldN(usize);
-    impl Future for YieldN {
-        type Output = usize;
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<usize> {
-            if self.0 == 0 {
-                Poll::Ready(0)
-            } else {
-                self.0 -= 1;
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-        }
-    }
-
     let rt = Runtime::with_workers(4);
     let mut handles = Vec::with_capacity(50);
     for _ in 0..50 {
-        handles.push(rt.spawn(YieldN(20)));
+        handles.push(rt.spawn(async {
+            for _ in 0..20 {
+                nanorun::yield_now().await;
+            }
+            0_usize
+        }));
     }
     rt.block_on(async move {
         for h in handles {

@@ -1,12 +1,14 @@
 //! Executor: drives futures to completion.
 //!
-//! The [`multi`] submodule is the multi-worker driver that owns a
-//! shared reactor and round-robins runnable tasks across worker
+//! The `multi` submodule (crate-private) is the multi-worker driver that
+//! owns a shared reactor and round-robins runnable tasks across worker
 //! threads. The free function [`block_on`] wraps a one-shot
 //! single-worker [`crate::Runtime`] for users who just want to drive a
 //! future to completion without explicitly managing the runtime.
 
 pub(crate) mod multi;
+
+pub use multi::Handle;
 
 use core::future::Future;
 

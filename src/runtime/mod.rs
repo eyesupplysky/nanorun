@@ -16,6 +16,7 @@ use std::task::Wake;
 use std::thread::{self, Thread};
 
 use crate::executor::multi::Multi;
+use crate::executor::Handle;
 use crate::task::JoinHandle;
 
 /// Composed runtime: multi-worker executor + shared reactor.
@@ -28,9 +29,7 @@ impl Runtime {
     /// falling back to a single worker if the OS reports an error.
     #[must_use]
     pub fn new() -> Self {
-        let workers = thread::available_parallelism()
-            .map(NonZeroUsize::get)
-            .unwrap_or(1);
+        let workers = thread::available_parallelism().map_or(1, NonZeroUsize::get);
         Self::with_workers(workers)
     }
 
@@ -49,6 +48,15 @@ impl Runtime {
         F::Output: Send + 'static,
     {
         self.multi.spawner().spawn(future)
+    }
+
+    /// A cheap-clone [`Handle`] to this runtime, usable from any thread.
+    ///
+    /// Use this to spawn from off-runtime threads, or move a clone into a
+    /// future to spawn from inside a task without an `Arc<Runtime>`.
+    #[must_use]
+    pub fn handle(&self) -> Handle {
+        self.multi.handle()
     }
 
     /// Drive `f` to completion on this runtime.
@@ -93,6 +101,10 @@ fn block_on_handle<T>(mut handle: JoinHandle<T>) -> T
 where
     T: Send + 'static,
 {
+    assert!(
+        !context::is_worker(),
+        "Runtime::block_on cannot be called from inside a nanorun runtime worker thread",
+    );
     let waker = Waker::from(Arc::new(ThreadWaker(thread::current())));
     let mut cx = Context::from_waker(&waker);
     loop {
