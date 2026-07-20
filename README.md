@@ -1,18 +1,18 @@
 # nanorun
 
-A from-scratch async runtime in Rust, written as a clean reference implementation in the spirit of [`mio`](https://github.com/tokio-rs/mio) plus a stripped-down [`tokio`](https://github.com/tokio-rs/tokio).
+An async runtime in Rust.
 
-Hand-rolled wakers, a work-stealing multi-worker executor, a hierarchical timer wheel, and per-OS reactors (epoll on Linux, IOCP + AFD-poll on Windows) — every layer written for readability first.
+Wakers, a work-stealing multi-worker executor, a hierarchical timer wheel, and per-OS reactors (epoll on Linux, IOCP + AFD-poll on Windows).
 
 ## Features
 
 - **Multi-threaded executor.** Per-worker LIFO local queues, a shared injector, work-stealing across peers, periodic injector-fairness checks, idle workers parking through the reactor.
 - **`Runtime` + `Handle` + `spawn` + `JoinHandle`.** Construct a runtime, spawn `Send + 'static` futures from any thread, await them through a join handle.
-- **Async TCP.** `TcpListener` and `TcpStream` over the running reactor on Linux and Windows.
+- **Async TCP.** `TcpListener` and `TcpStream` over the running reactor. Linux is read/write-verified over loopback; Windows compiles against the same API but the AFD-poll readiness path is not yet reliable under load.
 - **Timers.** `sleep` and `timeout` backed by a hierarchical timer wheel (6 levels × 64 slots × 1 ms; ~2.2-year range, O(1) insert).
 - **Cooperative yield.** `yield_now` for CPU-bound loops on a worker.
 
-No external runtime dependencies — `tokio`, `mio`, `smol` are not pulled in. Linux uses `libc`; Windows uses `windows-sys`. Nothing else.
+Dependencies: `libc` on Linux, `windows-sys` on Windows.
 
 The API is pre-1.0 and may change.
 
@@ -107,7 +107,7 @@ nanorun::block_on(async {
 
 ## Architecture
 
-The runtime is layered top-down. Each layer is a few hundred lines and worth reading in order: `lib.rs` → `executor/` → `reactor/` → `time/` → `task/`.
+The runtime is layered top-down: `lib.rs` → `executor/` → `reactor/` → `time/` → `task/`.
 
 ### Executor (`src/executor/`)
 
@@ -154,8 +154,8 @@ The only place raw `libc` / `windows-sys` calls live. The Linux backend lives un
 ## Requirements
 
 - Rust **stable**, MSRV **1.75**.
-- No external runtime dependencies (`tokio`, `mio`, `smol` are not pulled in). Linux uses `libc`; Windows uses `windows-sys`.
 - Cross-platform: Linux and Windows have native fd-readiness reactors; macOS and other targets get an in-process fallback (cross-thread wakeups only, no async I/O).
+- The `net` echo-server test runs on Linux only — Windows readiness dispatch under load is still being debugged.
 
 ## License
 
