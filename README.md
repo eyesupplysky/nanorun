@@ -6,11 +6,11 @@ Wakers, a work-stealing multi-worker executor, a hierarchical timer wheel, and p
 
 ## Features
 
-- **Multi-threaded executor.** Per-worker LIFO local queues, a shared injector, work-stealing across peers, periodic injector-fairness checks, idle workers parking through the reactor.
-- **`Runtime` + `Handle` + `spawn` + `JoinHandle`.** Construct a runtime, spawn `Send + 'static` futures from any thread, await them through a join handle.
-- **Async TCP.** `TcpListener` and `TcpStream` over the running reactor. Linux is read/write-verified over loopback; Windows compiles against the same API but the AFD-poll readiness path is not yet reliable under load.
-- **Timers.** `sleep` and `timeout` backed by a hierarchical timer wheel (6 levels × 64 slots × 1 ms; ~2.2-year range, O(1) insert).
-- **Cooperative yield.** `yield_now` for CPU-bound loops on a worker.
+- **Multi-threaded executor:** Per-worker LIFO local queues, a shared injector, work-stealing across peers, periodic injector-fairness checks, idle workers parking through the reactor.
+- **`Runtime` + `Handle` + `spawn` + `JoinHandle`:** Construct a runtime, spawn `Send + 'static` futures from any thread, await them through a join handle.
+- **Async TCP:** `TcpListener` and `TcpStream` over the running reactor. Linux is read/write-verified over loopback; Windows compiles against the same API but the AFD-poll readiness path is not yet reliable under load.
+- **Timers:** `sleep` and `timeout` backed by a hierarchical timer wheel (6 levels × 64 slots × 1 ms; ~2.2-year range, O(1) insert).
+- **Cooperative yield:** `yield_now` for CPU-bound loops on a worker.
 
 Dependencies: `libc` on Linux, `windows-sys` on Windows.
 
